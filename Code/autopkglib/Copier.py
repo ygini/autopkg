@@ -25,6 +25,7 @@ from DmgMounter import DmgMounter
 
 __all__ = ["Copier"]
 
+OVERWRITE_DEFAULT = True
 
 class Copier(DmgMounter):
     description = "Copies source_path to destination_path."
@@ -42,7 +43,8 @@ class Copier(DmgMounter):
         },
         "overwrite": {
             "required": False,
-            "description": "Whether the destination will be overwritten if necessary.",
+            "description": ("Boolean for whether the destination will be overwritten "
+                            "if it already exists. Defaults to %s." % OVERWRITE_DEFAULT),
         },
     }
     output_variables = {
@@ -50,7 +52,7 @@ class Copier(DmgMounter):
     
     __doc__ = description
     
-    def copy(self, source_item, dest_item, overwrite=False):
+    def copy(self, source_item, dest_item, overwrite=True):
         '''Copies source_item to dest_item, overwriting if allowed'''
         # Remove destination if needed.
         if os.path.exists(dest_item) and overwrite:
@@ -62,22 +64,27 @@ class Copier(DmgMounter):
             except OSError, err:
                 raise ProcessorError(
                     "Can't remove %s: %s" % (dest_item, err.strerror))
+        if os.path.exists(dest_item) and not overwrite:
+            raise ProcessorError(
+                "Path %s already exists, and 'overwrite' is True." % dest_item)
                     
         # Copy file or directory.
-        try:
-            if os.path.isdir(source_item):
-                shutil.copytree(source_item, dest_item, symlinks=True)
-            elif not os.path.isdir(dest_item):
-                shutil.copyfile(source_item, dest_item)
-            else:
-                shutil.copy(source_item, dest_item)
-            self.output("Copied %s to %s" % (source_item, dest_item))
-        except BaseException, err:
-            raise ProcessorError(
-                "Can't copy %s to %s: %s" % (source_item, dest_item, err))
+        if not os.path.exists(dest_item) or overwrite:
+            try:
+                if os.path.isdir(source_item):
+                    shutil.copytree(source_item, dest_item, symlinks=True)
+                elif not os.path.isdir(dest_item):
+                    shutil.copyfile(source_item, dest_item)
+                else:
+                    shutil.copy(source_item, dest_item)
+                self.output("Copied %s to %s" % (source_item, dest_item))
+            except BaseException, err:
+                raise ProcessorError(
+                    "Can't copy %s to %s: %s" % (source_item, dest_item, err))
     
     def main(self):
         source_path = self.env['source_path']
+        overwrite = self.env.get("overwrite", OVERWRITE_DEFAULT)
         # Check if we're trying to copy something inside a dmg.
         (dmg_path, dmg,
          dmg_source_path) = source_path.partition(".dmg/")
@@ -104,7 +111,7 @@ class Copier(DmgMounter):
 
             # do the copy
             self.copy(matched_source_path, self.env['destination_path'],
-                      overwrite=self.env.get("overwrite"))
+                      overwrite=overwrite)
         finally:
             if dmg:
                 self.unmount(dmg_path)
