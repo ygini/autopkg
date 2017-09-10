@@ -1,0 +1,388 @@
+#!/usr/bin/python
+#
+# Copyright 2010 Per Olofsson
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""LaunchDaemon that creates installer packages from MacPorts.
+
+A packaging request is made by creating a property list file and sending it to
+the daemon's listening socket.
+
+Each request will trigger a port selfupdate.
+
+Each packaged ports will be fully cleaned before the packaging request.
+
+Protocol:
+
+    When a client connects to the server it should send an XML property list
+    with a packaging request. The server will process the request, and if
+    there are any problems it'll reply with one or more lines of:
+
+        ERROR:<error message 1>
+        ERROR:<error message 2>
+        ERROR:<error message 3...>
+
+    Otherwise it'll reply with OK and the path to the package:
+
+        OK:/Users/example/Downloads/example.pkg
+
+Request format:
+
+    Requests should be xml property list with a dictionary as the root object
+    and the following keys:
+
+    port            The name of the port to package
+
+    variants        List of variants related options (with + and -)
+                    presented as an array (i.e.: ["-preforkmpm","+workermpm"])
+
+    version         Specific version to package, starting with @. Optional value
+
+    pkgdir          Final location for requested package
+
+"""
+
+import os
+import sys
+import time
+import stat
+import logging, logging.handlers
+import SocketServer
+import socket
+import plistlib
+import re
+import struct
+import platform
+
+from portpackager import PortPackager, PortPackagerError
+
+
+###############
+## Constants ##
+###############
+
+
+APPNAME = "autopkgmacports"
+VERSION = "0.2"
+
+SOCKET = "/var/run/%s" % APPNAME
+
+request_structure = {
+    "port": str,
+    "variants": list,
+    "version": str,
+    "pkgdir": str,
+}
+
+
+#################
+## Global Init ##
+#################
+
+
+# Set up signal handlers.
+#def sig_handler(num, frame):
+#    log.error("%s aborted with signal %d" % (APPNAME, num))
+#
+#signal.signal(signal.SIGHUP, sig_handler)
+#signal.signal(signal.SIGINT, sig_handler)
+#signal.signal(signal.SIGTERM, sig_handler)
+
+
+class AutoPkgMacPortsError(Exception):
+    """Exception class for AutoPkgMacPorts errors"""
+    pass
+
+class PkgHandler(SocketServer.StreamRequestHandler):
+    """Handler for packaging requests."""
+
+    re_uid_gid = re.compile(
+        r'^AUTH:AUTHENTICATE (?P<uid>\d{1,10}):(?P<gid>\d{1,10})$')
+
+    def verify_request_syntax(self, plist):
+        """Verify the basic syntax of request plist."""
+
+        # Keep a list of error messages.
+        errors = list()
+
+        # Root should be a dictionary.
+        if not isinstance(plist, dict):
+            errors.append("Request root is not a dictionary")
+            # Bail out early if it's not.
+            return (False, errors)
+
+        syntax_ok = True
+
+        # Verify existance and type of keys in the root.
+        for key, keytype in request_structure.items():
+            if not key in plist:
+                errors.append("Request is missing key '%s'" % key)
+                syntax_ok = False
+            else:
+                if not isinstance(plist[key], keytype):
+                    errors.append( \
+                        "Request key %s is not of type %s" % \
+                        (key, str(keytype)))
+                    syntax_ok = False
+
+        return (syntax_ok, errors)
+
+    def getpeerid(self):
+        """
+        Get peer credentials on a UNIX domain socket.
+        Returns uid, gids.
+        """
+
+        # /usr/include/sys/ucred.h
+        #
+        # struct xucred {
+        #         u_int   cr_version;            /* structure layout version */
+        #         uid_t   cr_uid;                /* effective user id */
+        #         short   cr_ngroups;            /* number of advisory groups */
+        #         gid_t   cr_groups[NGROUPS];    /* advisory group list */
+        # };
+
+        LOCAL_PEERCRED = 0x001
+        XUCRED_VERSION = 0
+        NGROUPS = 16
+        cr_version = 0
+        cr_uid = 1
+        cr_ngroups = 2
+        cr_groups = 3
+
+        xucred_fmt = "IIh%dI" % NGROUPS
+        res = struct.unpack(
+            xucred_fmt,
+            self.request.getsockopt(
+                0, LOCAL_PEERCRED, struct.calcsize(xucred_fmt)))
+
+        if res[cr_version] != XUCRED_VERSION:
+            raise OSError("Incompatible struct xucred version")
+
+        return res[cr_uid], res[cr_groups:cr_groups + res[cr_ngroups]]
+
+    def handle(self):
+        """Handle an incoming packaging request."""
+
+        try:
+            # Log through server parent.
+            self.log = self.server.log
+            self.log.debug("Handling request")
+
+            # Get uid and primary gid of connecting peer.
+            uid, gids = self.getpeerid()
+            gid = gids[0]
+            self.log.debug(
+                "Got port request from uid %d gid %d" % (uid, gid))
+
+            # Receive a plist.
+            plist_string = self.request.recv(8192)
+
+            # Try to parse it.
+            try:
+                plist = plistlib.readPlistFromString(plist_string)
+            except BaseException as err:
+                self.log.error("Malformed request")
+                self.request.send("ERROR:Malformed request\n")
+                return
+            self.log.debug("Parsed request plist")
+
+            # Verify the plist syntax.
+            syntax_ok, errors = self.verify_request_syntax(plist)
+            if not syntax_ok:
+                self.log.error("Plist syntax error")
+                self.request.send("".join(["ERROR:%s\n" % e for e in errors]))
+                return
+
+            # TODO: Should be replaced by a check for port existance
+            # if os.path.exists(plist.portpkgroot):
+            #     name = os.path.basename(plist.portpkgroot)
+            # else:
+            #     self.request.send("ERROR:Can't find portpkgroot")
+            #     return
+
+            self.log.info(
+                "Dispatching worker to process request for user %d" % (uid))
+            try:
+                portpkgr = PortPackager(self.log, plist, uid, gid)
+                pkgpath = portpkgr.package()
+                self.log.info("Package built at %s" % pkgpath)
+                self.request.send("OK:%s\n" % pkgpath)
+            except PortPackagerError as err:
+                self.log.error("Packaging failed: %s" % (err))
+                self.request.send(str(err) + "\n")
+
+        except BaseException as err:
+            self.log.error("Caught exception: %s" % repr(err))
+            self.request.send("ERROR:Caught exception: %s" % repr(err))
+            return
+
+
+class AutoPkgMacPorts(SocketServer.UnixStreamServer):
+    """Daemon that runs as root, receiving requests to create installer
+    packages."""
+
+    allow_reuse_address = True
+    request_queue_size = 10
+    timeout = 10
+
+    def __init__(self, socket_fd, RequestHandlerClass):
+        # Avoid initialization of UnixStreamServer as we need to open the
+        # socket from a file descriptor instead of creating our own.
+        self.socket = socket.fromfd(
+            socket_fd, socket.AF_UNIX, socket.SOCK_STREAM)
+        self.socket.listen(self.request_queue_size)
+        SocketServer.BaseServer.__init__(self,
+                                         self.socket.getsockname(),
+                                         RequestHandlerClass)
+        self.timed_out = False
+
+    #def server_bind(self):
+    #    """Override binding to inherit socket from launchd."""
+    #
+
+    def setup_logging(self):
+        try:
+            self.log = logging.getLogger(APPNAME)
+            self.log.setLevel(logging.DEBUG)
+
+            log_console = logging.StreamHandler()
+            log_console.setLevel(logging.DEBUG)
+            log_file = logging.handlers.RotatingFileHandler(
+                "/private/var/log/%s" % APPNAME,
+                "a",
+                100000,
+                9,
+                "utf-8")
+            log_file.setLevel(logging.DEBUG)
+
+            console_formatter = logging.Formatter("%(message)s")
+            file_formatter = \
+                logging.Formatter("%(asctime)s %(module)s[%(process)d]: " + \
+                                  "%(message)s   (%(funcName)s)")
+
+            log_console.setFormatter(console_formatter)
+            log_file.setFormatter(file_formatter)
+
+            self.log.addHandler(log_console)
+            self.log.addHandler(log_file)
+        except (OSError, IOError) as err:
+            raise AutoPkgMacPortsError("Can't open log: %s" % (err.strerror))
+
+    def handle_timeout(self):
+        self.timed_out = True
+
+
+def main(argv):
+    # Make sure we're launched as root
+    if os.geteuid() != 0:
+        print >>sys.stderr, "%s must be run as root." % APPNAME
+        # Sleep to avoid respawn.
+        time.sleep(10)
+        return 1
+
+    # Make sure that the executable and all containing directories are owned
+    # by root:wheel or root:admin, and not writeable by other users.
+    root_uid = 0
+    wheel_gid = 0
+    admin_gid = 80
+
+    exepath = os.path.realpath(os.path.abspath(__file__))
+    path_ok = True
+    while True:
+        info = os.stat(exepath)
+        if info.st_uid != root_uid:
+            print >>sys.stderr, "%s must be owned by root." % exepath
+            path_ok = False
+        if info.st_gid not in (wheel_gid, admin_gid):
+            print >>sys.stderr, "%s must have group wheel or admin." % exepath
+            path_ok = False
+        if info.st_mode & stat.S_IWOTH:
+            print >>sys.stderr, "%s mustn't be world writeable." % exepath
+            path_ok = False
+        exepath = os.path.dirname(exepath)
+        if exepath == "/":
+            break
+
+    if not path_ok:
+        # Sleep to avoid respawn.
+        time.sleep(10)
+        return 1
+
+    # Keep track of time for launchd.
+    start_time = time.time()
+
+    # Get socket file descriptors from launchd.
+    if int(platform.mac_ver()[0].split(u".")[1]) >= 10:
+        import launch2
+        try:
+            sockets = launch2.launch_activate_socket("AutoPkgMacPorts")
+        except launch2.LaunchDError as err:
+            print >>sys.stderr, "launchd check-in failed: %s" % err
+            time.sleep(10)
+            return 1
+
+        sock_fd = sockets[0]
+
+    else:
+        import launch
+        try:
+            sockets = launch.get_launchd_socket_fds()
+        except launch.LaunchDCheckInError as err:
+            print >>sys.stderr, "launchd check-in failed: %s" % err
+            time.sleep(10)
+            return 1
+
+        if not "AutoPkgMacPorts" in sockets:
+            print >>sys.stderr, "No AutoPkgMacPorts in launchd sockets"
+            time.sleep(10)
+            return 1
+
+        sock_fd = sockets["AutoPkgMacPorts"][0]
+
+    # Create the server object.
+    server = AutoPkgMacPorts(sock_fd, PkgHandler)
+    server.setup_logging()
+
+    # Wrap main loop in try/finally to unlink the socket when we exit.
+    try:
+        server.log.info("%s v%s starting" % (APPNAME, VERSION))
+
+        # Serve all pending requests until we time out.
+        while True:
+            server.handle_request()
+            if server.timed_out == False:
+                continue
+
+            # Keep running for at least 10 seconds make launchd happy.
+            run_time = time.time() - start_time
+            server.log.info("run time: %fs" % run_time)
+            if run_time < 10.0:
+                # Only sleep for a short while in case new requests pop up.
+                sleep_time = min(1.0, 10.0 - run_time)
+                server.log.debug(
+                    "sleeping for %f seconds to make launchd happy"
+                    % sleep_time)
+                time.sleep(sleep_time)
+            else:
+                break
+    finally:
+        # Make sure the socket is removed.
+        #os.unlink(SOCKET)
+        pass
+
+    return 0
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))
