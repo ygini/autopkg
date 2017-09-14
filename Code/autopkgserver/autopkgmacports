@@ -44,10 +44,10 @@ Request format:
 
     port            The name of the port to package
 
-    variants        List of variants related options (with + and -)
-                    presented as an array (i.e.: ["-preforkmpm","+workermpm"])
+    variants        Optional. List of variants related options (with + and -)
+                    presented as an array (i.e.: ["-preforkmpm","+workermpm"]).
 
-    version         Specific version to package, starting with @. Optional value
+    version         Optional. Specific version to package, starting with @.
 
     pkgdir          Final location for requested package
 
